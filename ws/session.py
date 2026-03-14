@@ -1,12 +1,11 @@
 """
-ws/session.py — FlowState  (stable, immediate responses)
+ws/session.py — FlowState (unified send queue, Windows-safe)
 
-KEY CHANGES vs previous:
-  - Model switched to gemini-2.0-flash-live-001 (no thinking delay, instant response)
-  - Silence injected every 2s (was 4s) — well within any keepalive window
-  - turn_done starts SET so welcome message sends immediately
-  - Writer loop sends silence via its own tight sub-loop, never skipped
-  - No is_responding, no complex guards — simple and reliable
+ARCHITECTURE:
+  All sends to Gemini go through a single asyncio.Queue (gemini_q).
+  One dedicated task (_gemini_sender) is the ONLY coroutine that calls
+  live_session.send(). This eliminates send contention on Windows
+  ProactorEventLoop which was causing 1006 keepalive failures.
 """
 from __future__ import annotations
 import asyncio, json, logging, traceback, time
@@ -21,106 +20,122 @@ from gemini_config import build_live_config
 logger = logging.getLogger("flowstate.session")
 router = APIRouter(tags=["AI Session"])
 
-_SILENCE_SM = bytes(6400)   # 200ms @ 16kHz 16-bit mono — used for normal keepalive
-_SILENCE_LG = bytes(12800)  # 400ms @ 16kHz 16-bit mono — used during long AI responses
+_SILENCE_SM = bytes(6400)    # 200ms @ 16kHz 16-bit mono
+_SILENCE_LG = bytes(12800)   # 400ms @ 16kHz 16-bit mono
 
 _client = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options={"api_version": "v1alpha"},
 )
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 async def _jx(ws: WebSocket, d: dict) -> None:
     try: await ws.send_text(json.dumps(d))
     except Exception: pass
 
-async def _bx(ws: WebSocket, b: bytes) -> None:
-    try: await ws.send_bytes(b)
-    except Exception: pass
+async def _gemini_sender(live_session, gemini_q: asyncio.Queue,
+                         stop: asyncio.Event) -> None:
+    """THE only task that calls live_session.send(). Drains gemini_q serially."""
+    while not stop.is_set():
+        try:
+            msg = await asyncio.wait_for(gemini_q.get(), timeout=0.3)
+        except asyncio.TimeoutError:
+            continue
+        except asyncio.CancelledError:
+            break
+        kind = msg[0]
+        try:
+            if kind in ("silence", "audio"):
+                await live_session.send(input=types.LiveClientRealtimeInput(
+                    media_chunks=[types.Blob(data=msg[1], mime_type="audio/pcm;rate=16000")]
+                ))
+            elif kind == "text":
+                await live_session.send(input=types.LiveClientContent(
+                    turns=[types.Content(role="user",
+                                         parts=[types.Part.from_text(text=msg[1])])],
+                    turn_complete=True,
+                ))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"  [SEND] {kind} err: {e}")
 
-# ── SILENCE KEEPER — dedicated task, fires every 0.8s, never blocked ───────────
-async def _silence_keeper(live_session, stop: asyncio.Event,
+
+async def _audio_out_sender(ws: WebSocket, audio_out_q: asyncio.Queue,
+                             stop: asyncio.Event) -> None:
+    """Sends AI audio bytes to browser. Isolated so receiver never blocks."""
+    while not stop.is_set():
+        try:
+            data = await asyncio.wait_for(audio_out_q.get(), timeout=0.5)
+            await asyncio.wait_for(ws.send_bytes(data), timeout=2.0)
+        except asyncio.TimeoutError:
+            continue
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+async def _silence_keeper(gemini_q: asyncio.Queue, stop: asyncio.Event,
                            ai_speaking: asyncio.Event) -> None:
-    """
-    Completely independent task — ONLY sends silence to keep connection alive.
-
-    Critical insight: gemini-2.5-flash-native-audio-preview can generate long
-    audio responses (10-30s). During this time the connection must receive
-    continuous input or Google's server-side keepalive will close it with 1006.
-
-    Fix:
-    - Fire every 0.8s (was 1.5s) — well within any keepalive window
-    - Send 400ms chunks while AI is speaking (bigger = more robust signal)
-    - Send 200ms chunks when AI is idle (lighter load)
-    - Never catch CancelledError silently — let it propagate cleanly
-    """
+    """Enqueues silence every 500ms. Never calls live_session directly."""
     ka_count = 0
     while not stop.is_set():
         try:
-            await asyncio.sleep(0.5)   # every 500ms — much safer margin
+            await asyncio.sleep(0.5)
             if stop.is_set(): break
-            # During AI audio generation send the larger chunk more aggressively
             chunk = _SILENCE_LG if ai_speaking.is_set() else _SILENCE_SM
-            # Use asyncio.wait_for so a blocked send never stalls the loop
-            await asyncio.wait_for(
-                live_session.send(input=types.LiveClientRealtimeInput(
-                    media_chunks=[types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")]
-                )),
-                timeout=1.0   # if send blocks >1s, skip and retry next cycle
-            )
+            try: gemini_q.put_nowait(("silence", chunk))
+            except asyncio.QueueFull: pass
             ka_count += 1
-            if ka_count % 10 == 0:   # log every 5s so we can verify it's firing
-                speaking = ai_speaking.is_set()
-                logger.info(f"  [KA] 🔇 x{ka_count} {'(AI SPEAKING)' if speaking else '(idle)'}")
-        except asyncio.TimeoutError:
-            logger.warning("  [KA] ⚠️ send timed out — skipping cycle")
+            if ka_count % 10 == 0:
+                logger.info(f"  [KA] 🔇 x{ka_count} "
+                            f"{'(AI SPEAKING)' if ai_speaking.is_set() else '(idle)'}")
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.warning(f"  [KA] err: {e}")
 
-# ── AUDIO SENDER — dedicated task for mic audio ───────────────────────────────
-async def _audio_sender(live_session, audio_q: asyncio.Queue, stop: asyncio.Event) -> None:
-    """Sends mic audio to Gemini. Completely separate from text/silence."""
+
+async def _audio_sender(audio_q: asyncio.Queue, gemini_q: asyncio.Queue,
+                         stop: asyncio.Event) -> None:
+    """Forwards mic audio into the unified send queue."""
     while not stop.is_set():
         try:
             chunk = await asyncio.wait_for(audio_q.get(), timeout=0.5)
-            await live_session.send(input=types.LiveClientRealtimeInput(
-                media_chunks=[types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")]
-            ))
+            try: gemini_q.put_nowait(("audio", chunk))
+            except asyncio.QueueFull: pass
         except asyncio.TimeoutError: continue
         except asyncio.CancelledError: break
         except Exception as e: logger.warning(f"  [AUDIO] {e}")
 
-# ── TEXT SENDER — dedicated task for user text ────────────────────────────────
-async def _text_sender(live_session, text_q: asyncio.Queue,
+
+async def _text_sender(text_q: asyncio.Queue, gemini_q: asyncio.Queue,
                        stop: asyncio.Event, turn_done: asyncio.Event) -> None:
-    """Sends user text to Gemini. Waits for turn_done before sending."""
+    """Enqueues user text. Waits for turn_done (max 5s) then sends."""
     while not stop.is_set():
         try:
             text = await asyncio.wait_for(text_q.get(), timeout=0.5)
         except asyncio.TimeoutError: continue
         except asyncio.CancelledError: break
 
-        # Wait until previous turn is complete (max 60s)
         try:
-            await asyncio.wait_for(turn_done.wait(), timeout=60.0)
+            await asyncio.wait_for(turn_done.wait(), timeout=5.0)
         except asyncio.TimeoutError:
-            logger.warning("  [TEXT] turn_done timeout — sending anyway")
+            logger.warning("  [TEXT] interrupting AI — sending now")
+            turn_done.set()
 
         try:
             logger.info(f"  [TEXT] 💬 → Gemini: \"{text[:120]}\"")
-            await live_session.send(input=types.LiveClientContent(
-                turns=[types.Content(role="user",
-                                     parts=[types.Part.from_text(text=text)])],
-                turn_complete=True,
-            ))
-            turn_done.clear()   # AI is now generating
+            gemini_q.put_nowait(("text", text))
+            turn_done.clear()
+        except asyncio.QueueFull:
+            logger.warning("  [TEXT] gemini_q full — dropping")
+            turn_done.set()
         except Exception as e:
-            logger.warning(f"  [TEXT] send err: {e}")
-            turn_done.set()     # restore on failure
+            logger.warning(f"  [TEXT] err: {e}")
+            turn_done.set()
 
-# ── DEMUX ─────────────────────────────────────────────────────────────────────
+
 async def _demux(ws: WebSocket, audio_q: asyncio.Queue,
                  text_q: asyncio.Queue, stop: asyncio.Event) -> None:
     na = ni = 0
@@ -140,7 +155,7 @@ async def _demux(ws: WebSocket, audio_q: asyncio.Queue,
                     try: audio_q.put_nowait(payload)
                     except asyncio.QueueFull: pass
                 elif tag == TAG_IMAGE:
-                    ni += 1  # discard
+                    ni += 1
                 elif tag == TAG_TEXT:
                     t = payload.decode("utf-8", errors="replace").strip()
                     if t:
@@ -156,7 +171,7 @@ async def _demux(ws: WebSocket, audio_q: asyncio.Queue,
         logger.error(f"[DEMUX] {e}\n{traceback.format_exc()}")
         stop.set()
 
-# ── NODE PARSER ───────────────────────────────────────────────────────────────
+
 def _parse_node(line: str) -> dict | None:
     s = line.strip()
     if not s.startswith("NODE:"): return None
@@ -172,29 +187,31 @@ def _parse_node(line: str) -> dict | None:
         }
     except Exception: return None
 
+
 def _strip_nodes(text: str) -> str:
     return "\n".join(
         l for l in text.splitlines()
         if not l.strip().startswith("NODE:")
     ).strip()
 
-# ── RECEIVER ─────────────────────────────────────────────────────────────────
+
 async def _receiver(ws: WebSocket, live_session,
                     session: session_store.SessionState,
                     stop: asyncio.Event, turn_done: asyncio.Event,
                     node_q: asyncio.Queue,
-                    ai_speaking: asyncio.Event) -> None:
+                    ai_speaking: asyncio.Event,
+                    audio_out_q: asyncio.Queue) -> None:
     buf = ""; scan_pos = 0
     drawn: set[str] = set()
-
     try:
         while not stop.is_set():
             async for resp in live_session.receive():
                 if stop.is_set(): break
 
                 if resp.data:
-                    ai_speaking.set()   # AI is generating audio — ramp up silence keepalive
-                    await _bx(ws, resp.data)
+                    ai_speaking.set()
+                    try: audio_out_q.put_nowait(resp.data)
+                    except asyncio.QueueFull: pass
 
                 if resp.server_content:
                     sc = resp.server_content
@@ -219,7 +236,7 @@ async def _receiver(ws: WebSocket, live_session,
                                 await _jx(ws, {"type":"transcript","role":"model","text":visible})
 
                     if getattr(sc, "turn_complete", False):
-                        ai_speaking.clear()  # AI done speaking — back to light keepalive
+                        ai_speaking.clear()
                         logger.info("  [GEMINI] ✅ Turn complete")
                         if buf.strip():
                             for line in buf[scan_pos:].splitlines():
@@ -247,13 +264,8 @@ async def _receiver(ws: WebSocket, live_session,
         turn_done.set()
         stop.set()
 
-# ── DRIP ──────────────────────────────────────────────────────────────────────
+
 async def _drip(ws: WebSocket, node_q: asyncio.Queue, stop: asyncio.Event) -> None:
-    """
-    Drip nodes to canvas one by one.
-    Adaptive speed: starts at 1.8s, speeds up after 8 nodes (large diagrams).
-    This gives the AI time to explain each node before the next one appears.
-    """
     count = 0
     while not stop.is_set():
         try: node = await asyncio.wait_for(node_q.get(), timeout=1.0)
@@ -262,13 +274,10 @@ async def _drip(ws: WebSocket, node_q: asyncio.Queue, stop: asyncio.Event) -> No
         await _jx(ws, node)
         count += 1
         logger.info(f"  [CANVAS] 🎨 [{count}] '{node['node_name']}' ({node['node_type']})")
-        # Adaptive pacing: slower for first 8 nodes (clear explanation time),
-        # faster after that to avoid the user waiting too long on big diagrams
-        delay = 1.8 if count <= 8 else 1.2
-        try: await asyncio.sleep(delay)
+        try: await asyncio.sleep(1.5 if count <= 8 else 1.0)
         except asyncio.CancelledError: break
 
-# ── HEARTBEAT ─────────────────────────────────────────────────────────────────
+
 async def _heartbeat(ws: WebSocket, stop: asyncio.Event) -> None:
     while not stop.is_set():
         try: await asyncio.sleep(20)
@@ -276,13 +285,15 @@ async def _heartbeat(ws: WebSocket, stop: asyncio.Event) -> None:
         if not stop.is_set():
             await _jx(ws, {"type":"ping"})
 
-# ── SESSION ───────────────────────────────────────────────────────────────────
+
 async def _run(ws: WebSocket, live: Any, session: Any, stop: asyncio.Event,
                audio_q: asyncio.Queue, text_q: asyncio.Queue) -> None:
-    turn_done   = asyncio.Event()
-    turn_done.set()        # start ready to send
-    ai_speaking = asyncio.Event()  # set while Gemini is generating audio output
-    node_q: asyncio.Queue = asyncio.Queue(maxsize=200)
+    turn_done    = asyncio.Event()
+    turn_done.set()
+    ai_speaking  = asyncio.Event()
+    gemini_q:    asyncio.Queue = asyncio.Queue(maxsize=60)
+    node_q:      asyncio.Queue = asyncio.Queue(maxsize=200)
+    audio_out_q: asyncio.Queue = asyncio.Queue(maxsize=100)
 
     await _jx(ws, {"type":"status","status":"ai_ready"})
     logger.info("  [SESSION] ✅ Gemini Live OPEN")
@@ -293,7 +304,6 @@ async def _run(ws: WebSocket, live: Any, session: Any, stop: asyncio.Event,
         node_count  = len(session.ai_nodes)
         import random
         if history_len == 0:
-            # Fresh session — rotate between varied confident greetings
             greetings = [
                 "Greet the user with exactly: 'FlowState online — what are we designing today?'",
                 "Greet the user with exactly: 'Hey, FlowState here — give me a topic and I will bring it to life on your canvas.'",
@@ -306,9 +316,11 @@ async def _run(ws: WebSocket, live: Any, session: Any, stop: asyncio.Event,
                 " Do NOT draw any nodes. Do NOT say anything else beyond this greeting."
             )
         else:
-            # Returning user with context
             last_nodes = [n.get("node_name","") for n in session.ai_nodes[-3:]] if node_count > 0 else []
-            node_hint  = f" The canvas has {node_count} nodes" + (f" including {', '.join(last_nodes)}." if last_nodes else ".") if node_count > 0 else ""
+            node_hint  = (
+                f" The canvas has {node_count} nodes" +
+                (f" including {', '.join(last_nodes)}." if last_nodes else ".")
+            ) if node_count > 0 else ""
             text_q.put_nowait(
                 f"Welcome back the user in ONE sentence.{node_hint} "
                 f"The session has {history_len} previous exchanges. "
@@ -320,13 +332,16 @@ async def _run(ws: WebSocket, live: Any, session: Any, stop: asyncio.Event,
     asyncio.create_task(_welcome())
 
     tasks = [
-        asyncio.ensure_future(_demux         (ws,   audio_q, text_q, stop)),
-        asyncio.ensure_future(_audio_sender  (live, audio_q, stop)),
-        asyncio.ensure_future(_text_sender   (live, text_q,  stop, turn_done)),
-        asyncio.ensure_future(_silence_keeper(live, stop, ai_speaking)),
-        asyncio.ensure_future(_receiver      (ws,   live, session, stop, turn_done, node_q, ai_speaking)),
-        asyncio.ensure_future(_drip          (ws,   node_q, stop)),
-        asyncio.ensure_future(_heartbeat     (ws,   stop)),
+        asyncio.ensure_future(_demux           (ws,        audio_q,    text_q,    stop)),
+        asyncio.ensure_future(_gemini_sender   (live,      gemini_q,   stop)),
+        asyncio.ensure_future(_audio_sender    (audio_q,   gemini_q,   stop)),
+        asyncio.ensure_future(_text_sender     (text_q,    gemini_q,   stop, turn_done)),
+        asyncio.ensure_future(_silence_keeper  (gemini_q,  stop,       ai_speaking)),
+        asyncio.ensure_future(_receiver        (ws, live, session, stop, turn_done,
+                                                node_q, ai_speaking, audio_out_q)),
+        asyncio.ensure_future(_audio_out_sender(ws,        audio_out_q, stop)),
+        asyncio.ensure_future(_drip            (ws,        node_q,     stop)),
+        asyncio.ensure_future(_heartbeat       (ws,        stop)),
     ]
     try:
         await stop.wait()
@@ -336,7 +351,7 @@ async def _run(ws: WebSocket, live: Any, session: Any, stop: asyncio.Event,
         await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("  [SESSION] 🛑 Session ended")
 
-# ── ENDPOINT ──────────────────────────────────────────────────────────────────
+
 @router.websocket("/ws/session/{workspace_id}")
 async def ai_session(websocket: WebSocket, workspace_id: str,
                      mode: str = Query(default="assisted")) -> None:
@@ -350,7 +365,7 @@ async def ai_session(websocket: WebSocket, workspace_id: str,
     audio_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=300)
     text_q:  asyncio.Queue[str]   = asyncio.Queue(maxsize=20)
     stop = asyncio.Event()
-    # Per-workspace backoff counter stored on session object
+
     backoff = getattr(session, "_connect_backoff", 0)
     if backoff > 0:
         logger.info(f"  [SESSION] ⏳ Network backoff {backoff}s...")
@@ -360,11 +375,10 @@ async def ai_session(websocket: WebSocket, workspace_id: str,
     try:
         config = build_live_config(history_context=session.history_as_text())
         logger.info(f"  DEBUG |   [SESSION] 🧠 Connecting (model={GEMINI_MODEL}, api=v1alpha)")
-        session._connect_backoff = 0   # reset on successful connect
+        session._connect_backoff = 0
         async with _client.aio.live.connect(model=GEMINI_MODEL, config=config) as live:
             await _run(websocket, live, session, stop, audio_q, text_q)
     except (TimeoutError, OSError) as exc:
-        # Pure network failure — DNS/TCP timeout, not an API error
         delay = min(max(getattr(session, "_connect_backoff", 0), 1) * 2, 30)
         session._connect_backoff = delay
         msg = f"Network timeout connecting to Gemini. Will retry in {delay}s."
@@ -380,4 +394,4 @@ async def ai_session(websocket: WebSocket, workspace_id: str,
     finally:
         stop.set()
         logger.info(f"  [SESSION] 🔴 Closed — {time.monotonic()-t0:.1f}s  "
-                    f"nodes={len(session.ai_nodes)}  history={len(session.history)}")
+                    f"nodes={len(session.ai_nodes)}  history={len(session.history)}")git add .

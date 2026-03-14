@@ -394,4 +394,4 @@ async def ai_session(websocket: WebSocket, workspace_id: str,
     finally:
         stop.set()
         logger.info(f"  [SESSION] 🔴 Closed — {time.monotonic()-t0:.1f}s  "
-                    f"nodes={len(session.ai_nodes)}  history={len(session.history)}")git add .
+                    f"nodes={len(session.ai_nodes)}  history={len(session.history)}")

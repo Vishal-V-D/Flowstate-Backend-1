@@ -23,10 +23,16 @@ router = APIRouter(tags=["AI Session"])
 _SILENCE_SM = bytes(6400)    # 200ms @ 16kHz 16-bit mono
 _SILENCE_LG = bytes(12800)   # 400ms @ 16kHz 16-bit mono
 
-_client = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options={"api_version": "v1alpha"},
-)
+_client = None
+try:
+    _client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options={"api_version": "v1alpha"},
+    )
+except Exception as e:
+    logger.error(f"Failed to initialize Gemini session client: {e}")
+    import traceback
+    traceback.print_exc()
 
 async def _jx(ws: WebSocket, d: dict) -> None:
     try: await ws.send_text(json.dumps(d))

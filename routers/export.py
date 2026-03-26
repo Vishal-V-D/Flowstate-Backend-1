@@ -20,7 +20,13 @@ logger = logging.getLogger("flowstate.export")
 
 router = APIRouter(prefix="/api/workspaces", tags=["Export"])
 
-_client = genai.Client(api_key=GEMINI_API_KEY)
+_client = None
+try:
+    _client = genai.Client(api_key=GEMINI_API_KEY)
+except Exception as e:
+    logger.error(f"Failed to initialize Gemini export client: {e}")
+    import traceback
+    traceback.print_exc()
 
 EXPORT_MODEL = "models/gemini-2.0-flash"  # fast text model for export
 

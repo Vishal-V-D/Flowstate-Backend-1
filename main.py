@@ -2,10 +2,10 @@
 main.py — FlowState AI Backend
 
 Run:
-    uvicorn main:app --reload --port 8000
+    uvicorn main:app --reload --port 8080
 
-Swagger UI: http://localhost:8000/docs
-WebSocket:  ws://localhost:8000/ws/session/{workspace_id}?mode=assisted
+Swagger UI: http://localhost:8080/docs
+WebSocket:  ws://localhost:8080/ws/session/{workspace_id}?mode=assisted
 """
 import logging
 import sys
@@ -61,8 +61,8 @@ def _validate_startup() -> None:
     # ── Routes ────────────────────────────────────────────────────
     logger.info("🔌  WebSocket endpoint    →  /ws/session/{{workspace_id}}?mode=assisted")
     logger.info("📡  REST API              →  /api/workspaces")
-    logger.info("📖  Swagger UI            →  http://localhost:8000/docs")
-    logger.info("📖  ReDoc                 →  http://localhost:8000/redoc")
+    logger.info("📖  Swagger UI            →  http://localhost:8080/docs")
+    logger.info("📖  ReDoc                 →  http://localhost:8080/redoc")
     logger.info("🌐  CORS allowed origins  →  " + ", ".join(ALLOWED_ORIGINS))
     logger.info("=" * 60)
 
@@ -136,5 +136,5 @@ def root():
     return {
         "service": "FlowState AI Backend ✨",
         "docs": "/docs",
-        "websocket": "ws://localhost:8000/ws/session/{workspace_id}?mode=assisted",
+        "websocket": "ws://localhost:8080/ws/session/{workspace_id}?mode=assisted",
     }
